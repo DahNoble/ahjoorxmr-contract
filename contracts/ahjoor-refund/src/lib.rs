@@ -5779,6 +5779,22 @@ impl AhjoorRefundContract {
             .set(&DataKey2::RefundExtensionLedgers, &extension_ledgers);
     }
 
+    /// Get the merchant response deadline and refund extension in ledgers.
+    /// Returns `(0, 0)` when neither value has been configured.
+    pub fn get_merchant_response_deadline(env: Env) -> (u32, u32) {
+        let deadline_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MerchantResponseDeadlineLedgers)
+            .unwrap_or(0);
+        let extension_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::RefundExtensionLedgers)
+            .unwrap_or(0);
+        (deadline_ledgers, extension_ledgers)
+    }
+
     pub fn set_merchant_auto_approve_exempt(
         env: Env,
         admin: Address,
