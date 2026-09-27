@@ -227,6 +227,21 @@ A suspended token can be reinstated in either of two ways:
 
 The admin can also extend an active suspension with `extend_token_suspension(admin, token, additional_ledgers)`, which appends more ledgers to the existing expiry window. Suspension history is retained for the most recent suspensions, capped at ten recorded entries.
 
+### Token Deprecation (grace period)
+
+`remove_token` is immediate and would break in-flight escrows, subscriptions and ROSCA groups denominated in that token. To phase a token out gracefully, the admin can deprecate it instead:
+
+| Function | Description |
+|---|---|
+| `deprecate_token(admin, token, sunset_ledger)` | Marks a whitelisted token `Deprecated` until `sunset_ledger`. Emits `TokenDeprecated`. |
+| `undeprecate_token(admin, token)` | Reverts a deprecation before the sunset ledger, restoring full status. |
+| `get_token_deprecation(token) → Option<TokenDeprecation>` | Returns `{ deprecated_at_ledger, sunset_ledger }` or `None`. |
+| `is_token_allowed_for_new(token) → bool` | Like `is_token_allowed`, but also returns `false` for deprecated tokens. |
+
+While deprecated, a token is rejected by `is_token_allowed_for_new` but still accepted by `is_token_allowed` / `is_whitelisted`. Once the current ledger reaches `sunset_ledger`, the next query lazily delists the token (same mechanics as `remove_token`), emits `TokenSunset`, and all checks return `false`.
+
+**Consuming contracts should switch their create-time checks** (creating an escrow, subscription, payment, ROSCA group, etc.) to `is_token_allowed_for_new`, and keep `is_token_allowed` for operations on existing positions so they keep working until the sunset.
+
 ### Example CLI call
 
 ```bash

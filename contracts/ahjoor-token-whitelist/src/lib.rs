@@ -40,6 +40,9 @@ pub enum Error {
     TokenHasNoQuota = 8,
     SuspensionExtensionOverflow = 9,
     RiskTierNotDefined = 10,
+    TokenAlreadyDeprecated = 11,
+    TokenNotDeprecated = 12,
+    InvalidSunsetLedger = 13,
 }
 
 #[contracttype]
@@ -95,6 +98,16 @@ pub struct TokenMetadata {
     pub canonical_oracle: Option<Address>,
 }
 
+/// Deprecation state of a whitelisted token. A deprecated token must not be
+/// used for new positions (see `is_token_allowed_for_new`) but remains valid
+/// for existing ones until `sunset_ledger`, after which it is delisted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenDeprecation {
+    pub deprecated_at_ledger: u32,
+    pub sunset_ledger: u32,
+}
+
 /// Result of a contract-level allowlist lookup.
 ///
 /// Not represented as `Option<Option<u32>>`: the SDK's blanket `Option<T>`
@@ -142,6 +155,7 @@ pub enum DataKey {
     ListingProposal(u32),
     VoteRecord(u32, Address),
     VoteWeightSnapshot(u32, Address),
+    TokenDeprecation(Address),
 }
 
 #[contracttype]
@@ -184,6 +198,8 @@ mod test_contract_allowlist;
 mod test_governance;
 #[cfg(test)]
 mod test_suspension;
+#[cfg(test)]
+mod test_deprecation;
 
 pub use client::TokenWhitelistClient;
 
@@ -288,38 +304,7 @@ impl TokenWhitelistContract {
         if !env.storage().persistent().has(&membership_key) {
             panic!("Token not whitelisted");
         }
-        let whitelist: Vec<Address> = env
-            .storage().persistent()
-            .get(&DataKey::WhitelistedTokens)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut new_whitelist = Vec::new(&env);
-        for existing_token in whitelist.iter() {
-            if existing_token != token {
-                new_whitelist.push_back(existing_token);
-            }
-        }
-        env.storage().persistent().set(&DataKey::WhitelistedTokens, &new_whitelist);
-        env.storage().persistent().extend_ttl(
-            &DataKey::WhitelistedTokens,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        env.storage().persistent().remove(&membership_key);
-        if env.storage().persistent().has(&DataKey::SuspensionRecord(token.clone())) {
-            env.storage().persistent().remove(&DataKey::SuspensionRecord(token.clone()));
-        }
-        if env.storage().persistent().has(&DataKey::TokenQuota(token.clone())) {
-            env.storage().persistent().remove(&DataKey::TokenQuota(token.clone()));
-        }
-        if env.storage().persistent().has(&DataKey::TokenTier(token.clone())) {
-            env.storage().persistent().remove(&DataKey::TokenTier(token.clone()));
-        }
-        if env.storage().persistent().has(&DataKey::TokenLimitOverride(token.clone())) {
-            env.storage().persistent().remove(&DataKey::TokenLimitOverride(token.clone()));
-        }
-        if env.storage().persistent().has(&DataKey::TokenMetadata(token.clone())) {
-            env.storage().persistent().remove(&DataKey::TokenMetadata(token.clone()));
-        }
+        Self::delist_token_storage(&env, &token);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         events::emit_token_delisted(&env, token, admin);
     }
@@ -431,8 +416,13 @@ impl TokenWhitelistContract {
 
     /// Check if a token is in the global whitelist (ignores suspension).
     /// O(1): backed by a per-token storage key, not a scan of the full list.
+    /// A deprecated token stays whitelisted until its sunset ledger; once the
+    /// sunset has passed it is lazily delisted and this returns `false`.
     pub fn is_whitelisted(env: Env, token: Address) -> bool {
-        env.storage().persistent().has(&DataKey::WhitelistMembership(token))
+        if !env.storage().persistent().has(&DataKey::WhitelistMembership(token.clone())) {
+            return false;
+        }
+        !Self::apply_sunset_if_due(&env, &token)
     }
 
     /// Check if a token is allowed (whitelist + suspension check).
@@ -440,6 +430,9 @@ impl TokenWhitelistContract {
     pub fn is_token_allowed(env: Env, token: Address) -> bool {
         let membership_key = DataKey::WhitelistMembership(token.clone());
         if !env.storage().persistent().has(&membership_key) {
+            return false;
+        }
+        if Self::apply_sunset_if_due(&env, &token) {
             return false;
         }
         env.storage().persistent().extend_ttl(
@@ -459,6 +452,70 @@ impl TokenWhitelistContract {
             events::emit_token_auto_reinstated(&env, token, current_ledger);
         }
         true
+    }
+
+    /// Create-time check for consuming contracts: like `is_token_allowed` but
+    /// also returns `false` for a deprecated token, so it can no longer be
+    /// used to open new escrows, subscriptions, ROSCA groups, etc. Existing
+    /// positions should keep using `is_token_allowed`, which accepts a
+    /// deprecated token until its sunset ledger.
+    pub fn is_token_allowed_for_new(env: Env, token: Address) -> bool {
+        if !Self::is_token_allowed(env.clone(), token.clone()) {
+            return false;
+        }
+        !env.storage().persistent().has(&DataKey::TokenDeprecation(token))
+    }
+
+    /// Marks a whitelisted token as deprecated. The token is rejected by
+    /// `is_token_allowed_for_new` immediately, stays valid for
+    /// `is_token_allowed` / `is_whitelisted` until `sunset_ledger`, and is
+    /// then lazily delisted. Admin-gated.
+    pub fn deprecate_token(env: Env, admin: Address, token: Address, sunset_ledger: u32) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if !env.storage().persistent().has(&DataKey::WhitelistMembership(token.clone())) {
+            panic!("Token not whitelisted");
+        }
+        let key = DataKey::TokenDeprecation(token.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("Token already deprecated");
+        }
+        let current_ledger = env.ledger().sequence();
+        if sunset_ledger <= current_ledger {
+            panic!("sunset_ledger must be in the future");
+        }
+        env.storage().persistent().set(
+            &key,
+            &TokenDeprecation { deprecated_at_ledger: current_ledger, sunset_ledger },
+        );
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_token_deprecated(&env, token, admin, sunset_ledger);
+    }
+
+    /// Reverts a deprecation, restoring the token's full status. Only
+    /// possible before the sunset ledger; afterwards the token has been
+    /// (or will lazily be) delisted and must be re-added. Admin-gated.
+    pub fn undeprecate_token(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        let key = DataKey::TokenDeprecation(token.clone());
+        let dep: TokenDeprecation = env
+            .storage().persistent()
+            .get(&key)
+            .expect("Token not deprecated");
+        if env.ledger().sequence() >= dep.sunset_ledger {
+            panic!("Token already sunset");
+        }
+        env.storage().persistent().remove(&key);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        events::emit_token_undeprecated(&env, token, admin);
+    }
+
+    /// Returns the deprecation record for `token`, or `None` if it is not
+    /// deprecated (or has already been sunset and delisted).
+    pub fn get_token_deprecation(env: Env, token: Address) -> Option<TokenDeprecation> {
+        env.storage().persistent().get(&DataKey::TokenDeprecation(token))
     }
 
     /// #589: Returns a bounded page of the whitelist instead of the full list.
@@ -910,6 +967,67 @@ impl TokenWhitelistContract {
         let bucket_span = (quota.period_ledgers / VOLUME_AGG_BUCKET_COUNT).max(1);
         let current_bucket_id = current_ledger / bucket_span;
         Self::sum_live_volume_buckets(&env, &token, current_bucket_id)
+    }
+
+    /// Removes `token` from the whitelist and clears its per-token state.
+    /// Shared by `remove_token` and the lazy sunset of deprecated tokens.
+    fn delist_token_storage(env: &Env, token: &Address) {
+        let membership_key = DataKey::WhitelistMembership(token.clone());
+        let whitelist: Vec<Address> = env
+            .storage().persistent()
+            .get(&DataKey::WhitelistedTokens)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_whitelist = Vec::new(env);
+        for existing_token in whitelist.iter() {
+            if existing_token != *token {
+                new_whitelist.push_back(existing_token);
+            }
+        }
+        env.storage().persistent().set(&DataKey::WhitelistedTokens, &new_whitelist);
+        env.storage().persistent().extend_ttl(
+            &DataKey::WhitelistedTokens,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().persistent().remove(&membership_key);
+        if env.storage().persistent().has(&DataKey::SuspensionRecord(token.clone())) {
+            env.storage().persistent().remove(&DataKey::SuspensionRecord(token.clone()));
+        }
+        if env.storage().persistent().has(&DataKey::TokenQuota(token.clone())) {
+            env.storage().persistent().remove(&DataKey::TokenQuota(token.clone()));
+        }
+        if env.storage().persistent().has(&DataKey::TokenTier(token.clone())) {
+            env.storage().persistent().remove(&DataKey::TokenTier(token.clone()));
+        }
+        if env.storage().persistent().has(&DataKey::TokenLimitOverride(token.clone())) {
+            env.storage().persistent().remove(&DataKey::TokenLimitOverride(token.clone()));
+        }
+        if env.storage().persistent().has(&DataKey::TokenMetadata(token.clone())) {
+            env.storage().persistent().remove(&DataKey::TokenMetadata(token.clone()));
+        }
+        if env.storage().persistent().has(&DataKey::TokenDeprecation(token.clone())) {
+            env.storage().persistent().remove(&DataKey::TokenDeprecation(token.clone()));
+        }
+    }
+
+    /// Lazily applies a passed sunset: if `token` is deprecated and the
+    /// current ledger is at or beyond its `sunset_ledger`, the token is
+    /// delisted and `TokenSunset` is emitted. Returns `true` if the token
+    /// has been sunset (and is therefore no longer whitelisted).
+    fn apply_sunset_if_due(env: &Env, token: &Address) -> bool {
+        let maybe: Option<TokenDeprecation> = env
+            .storage().persistent()
+            .get(&DataKey::TokenDeprecation(token.clone()));
+        let Some(dep) = maybe else {
+            return false;
+        };
+        let current_ledger = env.ledger().sequence();
+        if current_ledger < dep.sunset_ledger {
+            return false;
+        }
+        Self::delist_token_storage(env, token);
+        events::emit_token_sunset(env, token.clone(), dep.sunset_ledger, current_ledger);
+        true
     }
 
     fn require_admin(env: &Env, caller: &Address) {

@@ -239,4 +239,24 @@ pub enum ExtError2 {
     // ── Group Cloning ─────────────────────────────────────────────────────────
     /// The source contract address provided for cloning is invalid (same as this contract).
     CloneSourceInvalid = 133,
+    // ── Group Charter ─────────────────────────────────────────────────────────
+    /// No charter has been set for this group.
+    CharterNotSet = 134,
+    /// The acknowledged version does not match the current charter version.
+    CharterVersionMismatch = 135,
+    /// The member has not acknowledged the current charter version.
+    CharterNotAcknowledged = 136,
+    // ── Membership Succession ─────────────────────────────────────────────────
+    /// Successor must not be the member itself or an existing member of the group.
+    InvalidSuccessor = 137,
+    /// No successor designation exists for this member / successor pair.
+    SuccessorNotDesignated = 138,
+    /// The designated successor has already accepted.
+    SuccessionAlreadyAccepted = 139,
+    /// The designated successor has not accepted yet.
+    SuccessionNotAccepted = 140,
+    /// The member has not missed enough consecutive contributions yet.
+    SuccessionThresholdNotMet = 141,
+    /// Succession trigger rounds must be positive.
+    InvalidSuccessionTrigger = 142,
 }
