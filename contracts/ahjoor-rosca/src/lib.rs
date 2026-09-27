@@ -4589,6 +4589,84 @@ impl AhjoorContract {
         preferences.get(member).unwrap_or(false)
     }
 
+    /// Nominate `beneficiary` to receive `member`'s round payout instead of the
+    /// member's own address. Membership is not transferred. Changes are locked
+    /// while the member's payout round is in progress.
+    pub fn set_payout_beneficiary(env: Env, member: Address, beneficiary: Address) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+        Self::check_beneficiary_change_allowed(&env, &member);
+
+        if beneficiary == env.current_contract_address() {
+            panic_with_error!(&env, ExtError2::InvalidBeneficiary);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey5::PayoutBeneficiary(member.clone()), &beneficiary);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        events::emit_payout_beneficiary_set(&env, member, beneficiary);
+    }
+
+    /// Remove `member`'s nominated beneficiary so payouts go back to the member.
+    pub fn clear_payout_beneficiary(env: Env, member: Address) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+        Self::check_beneficiary_change_allowed(&env, &member);
+
+        env.storage()
+            .instance()
+            .remove(&DataKey5::PayoutBeneficiary(member.clone()));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        events::emit_payout_beneficiary_cleared(&env, member);
+    }
+
+    /// View: the beneficiary nominated by `member`, if any.
+    pub fn get_payout_beneficiary(env: Env, member: Address) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey5::PayoutBeneficiary(member))
+    }
+
+    fn check_beneficiary_change_allowed(env: &Env, member: &Address) {
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(member) {
+            panic_with_error!(env, Error::NotAMember);
+        }
+
+        // Lock changes once the member's payout round has started, i.e. the
+        // member is the scheduled recipient of the current round.
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .unwrap_or(Vec::new(env));
+        if payout_order.is_empty() {
+            return;
+        }
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let scheduled = payout_order
+            .get(current_round % payout_order.len())
+            .unwrap();
+        if scheduled == *member {
+            panic_with_error!(env, ExtError2::BeneficiaryLocked);
+        }
+    }
+
     pub fn vote_on_proposal(env: Env, voter: Address, proposal_id: u32, vote_for: bool) {
         internals::check_not_paused(&env);
         voter.require_auth();
@@ -12613,4 +12691,5 @@ mod test_view_functions;
 mod test_waitlist;
 mod test_voluntary_exit;
 mod test_prepay;
+mod test_payout_beneficiary;
 pub use events::*;
