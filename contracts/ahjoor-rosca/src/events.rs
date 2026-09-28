@@ -2199,90 +2199,57 @@ pub fn emit_group_cloned(
     .publish(e);
 }
 
-// ── Group Charter ─────────────────────────────────────────────────────────────
+// ── Payout Beneficiary Nomination ─────────────────────────────────────────────
 
-/// Event: A new charter version became the group's current charter.
+/// Event: A member nominated a beneficiary to receive their payout.
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct CharterSet {
-    pub version: u32,
-    pub charter_hash: BytesN<32>,
-    pub uri: soroban_sdk::String,
+pub struct PayoutBeneficiarySet {
+    pub member: Address,
+    pub beneficiary: Address,
 }
 
-pub fn emit_charter_set(e: &Env, version: u32, charter_hash: BytesN<32>, uri: soroban_sdk::String) {
-    CharterSet { version, charter_hash, uri }.publish(e);
+pub fn emit_payout_beneficiary_set(e: &Env, member: Address, beneficiary: Address) {
+    PayoutBeneficiarySet { member, beneficiary }.publish(e);
 }
 
-/// Event: A charter change after activation was submitted for governance.
+/// Event: A member cleared their nominated payout beneficiary.
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct CharterUpdateProposed {
-    pub proposal_id: u32,
-    pub proposer: Address,
-    pub charter_hash: BytesN<32>,
+pub struct PayoutBeneficiaryCleared {
+    pub member: Address,
 }
 
-pub fn emit_charter_update_proposed(
+pub fn emit_payout_beneficiary_cleared(e: &Env, member: Address) {
+    PayoutBeneficiaryCleared { member }.publish(e);
+}
+
+/// Event: A round payout was delivered. `beneficiary` is the address that
+/// actually received the funds (equal to `member` when none is nominated).
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PayoutDelivered {
+    pub round: u32,
+    pub member: Address,
+    pub beneficiary: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+pub fn emit_payout_delivered(
     e: &Env,
-    proposal_id: u32,
-    proposer: Address,
-    charter_hash: BytesN<32>,
-) {
-    CharterUpdateProposed { proposal_id, proposer, charter_hash }.publish(e);
-}
-
-/// Event: An address acknowledged a charter version.
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct CharterAcknowledged {
-    pub member: Address,
-    pub version: u32,
-}
-
-pub fn emit_charter_acknowledged(e: &Env, member: Address, version: u32) {
-    CharterAcknowledged { member, version }.publish(e);
-}
-
-// ── Membership Succession ─────────────────────────────────────────────────────
-
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct SuccessorDesignated {
-    pub member: Address,
-    pub successor: Address,
-}
-
-pub fn emit_successor_designated(e: &Env, member: Address, successor: Address) {
-    SuccessorDesignated { member, successor }.publish(e);
-}
-
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct SuccessorAccepted {
-    pub member: Address,
-    pub successor: Address,
-}
-
-pub fn emit_successor_accepted(e: &Env, member: Address, successor: Address) {
-    SuccessorAccepted { member, successor }.publish(e);
-}
-
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct SuccessionClaimed {
-    pub member: Address,
-    pub successor: Address,
-    pub missed_rounds: u32,
-    pub debt_transferred: i128,
-}
-
-pub fn emit_succession_claimed(
-    e: &Env,
+    round: u32,
     member: Address,
-    successor: Address,
-    missed_rounds: u32,
-    debt_transferred: i128,
+    beneficiary: Address,
+    token: Address,
+    amount: i128,
 ) {
-    SuccessionClaimed { member, successor, missed_rounds, debt_transferred }.publish(e);
+    PayoutDelivered {
+        round,
+        member,
+        beneficiary,
+        token,
+        amount,
+    }
+    .publish(e);
 }

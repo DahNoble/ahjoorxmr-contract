@@ -446,49 +446,9 @@ pub enum DataKey5 {
     /// by cloning another group.  None when the group was created from scratch.
     CloneOrigin,
 
-    // ── Group Charter ─────────────────────────────────────────────────────────
-    /// GroupCharter — current charter (hash + URI + version). Absent = no charter.
-    GroupCharter,
-    /// u32 — latest charter version acknowledged by an address (persistent).
-    CharterAck(Address),
-    /// (BytesN<32>, String) — charter awaiting a `CharterUpdate` proposal (persistent).
-    PendingCharter(u32),
-
-    // ── Membership Succession ─────────────────────────────────────────────────
-    /// u32 — consecutive missed contributions that allow a successor to claim.
-    SuccessionTriggerRounds,
-    /// Map<Address, u32> — consecutive rounds each member has missed.
-    ConsecutiveMisses,
-    /// SuccessorDesignation — member → designated successor (persistent).
-    Successor(Address),
-    /// Address — successor → the member whose slot they took over (persistent).
-    SucceededFrom(Address),
-}
-
-// ── Group Charter ─────────────────────────────────────────────────────────────
-
-/// Off-chain rules document anchored by hash. `version` starts at 1 and is
-/// bumped on every change; members must acknowledge the current version.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GroupCharter {
-    pub version: u32,
-    pub charter_hash: BytesN<32>,
-    pub uri: String,
-    pub set_at_ledger: u32,
-}
-
-// ── Membership Succession ─────────────────────────────────────────────────────
-
-/// A member's designated successor. The successor must accept before they
-/// can claim the slot.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SuccessorDesignation {
-    pub member: Address,
-    pub successor: Address,
-    pub accepted: bool,
-    pub designated_at_ledger: u32,
+    // ── Payout Beneficiary Nomination ─────────────────────────────────────────
+    /// Address — the beneficiary nominated by a member to receive their payout.
+    PayoutBeneficiary(Address),
 }
 
 // ── Scoped Co-Admin Role ──────────────────────────────────────────────────────

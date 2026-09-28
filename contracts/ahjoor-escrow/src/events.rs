@@ -1752,3 +1752,50 @@ pub fn emit_abandonment_bond_claimed(e: &Env, escrow_id: u32, seller: Address, a
     }
     .publish(e);
 }
+
+// ─── Third-Party Fee Sponsorship ─────────────────────────────────────────────
+
+/// Event: A third party pre-funded the protocol fee for an escrow
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EscrowFeeSponsored {
+    pub escrow_id: u32,
+    pub sponsor: Address,
+    pub amount: i128,
+}
+
+pub fn emit_escrow_fee_sponsored(e: &Env, escrow_id: u32, sponsor: Address, amount: i128) {
+    EscrowFeeSponsored {
+        escrow_id,
+        sponsor,
+        amount,
+    }
+    .publish(e);
+}
+
+/// Event: An escrow fee sponsorship was settled — `fee_covered` was paid as
+/// protocol fee and `returned` was sent back to the sponsor.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EscrowFeeSponsorshipSettled {
+    pub escrow_id: u32,
+    pub sponsor: Address,
+    pub fee_covered: i128,
+    pub returned: i128,
+}
+
+pub fn emit_escrow_fee_sponsorship_settled(
+    e: &Env,
+    escrow_id: u32,
+    sponsor: Address,
+    fee_covered: i128,
+    returned: i128,
+) {
+    EscrowFeeSponsorshipSettled {
+        escrow_id,
+        sponsor,
+        fee_covered,
+        returned,
+    }
+    .publish(e);
+}

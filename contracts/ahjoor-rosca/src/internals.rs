@@ -1,4 +1,4 @@
-use crate::{errors::{Error, ExtError}, events, audit_trail, ContributionEntry, CycleSnapshotData, DataKey, DataKey2, DataKey3, DataKey4, PersistentKey, PayoutRecord, SlotBid, types::{InsuranceClaim, InsuranceCoverageMode}};
+use crate::{errors::{Error, ExtError}, events, audit_trail, ContributionEntry, CycleSnapshotData, DataKey, DataKey2, DataKey3, DataKey4, DataKey5, PersistentKey, PayoutRecord, SlotBid, types::{InsuranceClaim, InsuranceCoverageMode}};
 use soroban_sdk::{panic_with_error, token, Address, Bytes, BytesN, Env, Map, Vec};
 
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100_000;
@@ -294,8 +294,22 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
                 reinvested_amount = payout_amount;
                 events::emit_payout_reinvested(env, payout_recipient.clone(), current_round, payout_amount);
             } else if payout_amount > 0 {
-                // Transfer payout to recipient
-                client.transfer(&env.current_contract_address(), &payout_recipient, &payout_amount);
+                // Transfer payout to the nominated beneficiary, or the recipient
+                // themselves when no beneficiary is set.
+                let payout_destination: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey5::PayoutBeneficiary(payout_recipient.clone()))
+                    .unwrap_or(payout_recipient.clone());
+                client.transfer(&env.current_contract_address(), &payout_destination, &payout_amount);
+                events::emit_payout_delivered(
+                    env,
+                    current_round,
+                    payout_recipient.clone(),
+                    payout_destination,
+                    token_addr.clone(),
+                    payout_amount,
+                );
             }
 
             // Transfer fee to fee recipient
