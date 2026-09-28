@@ -33,11 +33,13 @@ pub mod types;
 pub use types::*;
 
 mod audit_trail;
+mod charter;
 mod errors;
 mod events;
 mod internals;
 pub mod savings_goal_tracking;
 pub mod savings_goal_tracking_impl;
+mod succession;
 mod test_migration;
 mod test_reinvest;
 mod test_sealed_slot_auction;
@@ -836,6 +838,7 @@ impl AhjoorContract {
         if !members.contains(&contributor) {
             panic_with_error!(&env, Error::NotAMember);
         }
+        charter::require_charter_acknowledged(&env, &contributor);
 
         let activation_emitted: bool = env
             .storage()
@@ -1378,6 +1381,7 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey::Defaulters, &defaulters);
+        succession::track_consecutive_misses(&env, &members, &defaulters);
 
         let current_round: u32 = env
             .storage()
@@ -1438,7 +1442,27 @@ impl AhjoorContract {
         from_cycle: Option<u32>,
         to_cycle: Option<u32>,
     ) -> Vec<ContributionEntry> {
-        audit_trail::get_member_contribution_history(&env, member, from_cycle, to_cycle)
+        // A successor inherits the contribution history of the member(s)
+        // whose slot they claimed, so predecessor entries come first.
+        let mut chain: Vec<Address> = Vec::new(&env);
+        let mut cursor = succession::predecessor(&env, &member);
+        while let Some(prev) = cursor {
+            if chain.len() >= succession::MAX_SUCCESSION_CHAIN || chain.contains(&prev) {
+                break;
+            }
+            cursor = succession::predecessor(&env, &prev);
+            chain.push_front(prev);
+        }
+        let mut history: Vec<ContributionEntry> = Vec::new(&env);
+        for prev in chain.iter() {
+            history.append(&audit_trail::get_member_contribution_history(
+                &env, prev, from_cycle, to_cycle,
+            ));
+        }
+        history.append(&audit_trail::get_member_contribution_history(
+            &env, member, from_cycle, to_cycle,
+        ));
+        history
     }
 
     pub fn finalize_round(env: Env) {
@@ -1534,6 +1558,7 @@ impl AhjoorContract {
         env.storage()
             .instance()
             .set(&DataKey::Defaulters, &defaulters);
+        succession::track_consecutive_misses(&env, &members, &defaulters);
 
         events::emit_round_finalized(&env, current_round, defaulters.clone());
         env.storage()
@@ -3952,6 +3977,7 @@ impl AhjoorContract {
         if members.contains(&new_member) {
             panic_with_error!(&env, Error::AlreadyAMember);
         }
+        charter::require_charter_acknowledged(&env, &new_member);
         members.push_back(new_member.clone());
         env.storage().instance().set(&DataKey::Members, &members);
 
@@ -4944,6 +4970,9 @@ impl AhjoorContract {
                     .instance()
                     .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
                 return;
+            }
+            ProposalType::CharterUpdate => {
+                charter::execute_charter_update(&env, proposal_id);
             }
             ProposalType::MemberFreeze => {
                 let mut reasons: Map<u32, BytesN<32>> = env
@@ -7288,6 +7317,7 @@ impl AhjoorContract {
         internals::check_not_paused(&env);
         internals::check_not_frozen(&env);
         member.require_auth();
+        charter::require_charter_acknowledged(&env, &member);
 
         if num_rounds == 0 {
             panic_with_error!(&env, ExtError2::InvalidPrepayRounds);
@@ -7588,6 +7618,7 @@ impl AhjoorContract {
         if !approved_invitees.contains(&invitee) {
             panic_with_error!(&env, Error::InviteNotFound);
         }
+        charter::require_charter_acknowledged(&env, &invitee);
 
         // Remove from approved list
         let mut new_approved: Vec<Address> = Vec::new(&env);
@@ -9222,6 +9253,7 @@ impl AhjoorContract {
         internals::check_not_paused(&env);
         internals::check_not_frozen(&env);
         proxy.require_auth();
+        charter::require_charter_acknowledged(&env, &member);
 
         let start_at = Self::get_start_time(env.clone());
         if env.ledger().timestamp() < start_at {
@@ -10022,6 +10054,7 @@ impl AhjoorContract {
         if !members.contains(&member) {
             panic!("Only existing members can join with a tier; use add_member first");
         }
+        charter::require_charter_acknowledged(&env, &member);
 
         // Check min credit score before allowing join
         Self::require_min_credit_score_internal(&env, &member);
@@ -10709,6 +10742,7 @@ impl AhjoorContract {
     ) {
         internals::check_not_paused(&env);
         proxy.require_auth();
+        charter::require_charter_acknowledged(&env, &member);
 
         // Validate delegation
         let delegations: Map<Address, ContribDelegationRecord> = env
@@ -12018,6 +12052,7 @@ impl AhjoorContract {
         internals::check_not_paused(&env);
         internals::check_not_frozen(&env);
         member.require_auth();
+        charter::require_charter_acknowledged(&env, &member);
 
         let start_at: u64 = env
             .storage()
@@ -12655,6 +12690,151 @@ impl AhjoorContract {
             contribution_amount,
         );
         // TTL already bumped by init; no extra extend needed.
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Group Charter ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Admin: anchor the group's off-chain charter by hash.
+    ///
+    /// Before the group is activated (first contribution recorded) the charter
+    /// takes effect immediately as the next version and `None` is returned.
+    /// After activation the change must pass governance: a `CharterUpdate`
+    /// proposal is opened and its id returned; the charter is applied when
+    /// that proposal is executed.
+    ///
+    /// Once a charter exists, joining requires acknowledging the current
+    /// version, and existing members must acknowledge each new version
+    /// before their next contribution.
+    pub fn set_group_charter(
+        env: Env,
+        admin: Address,
+        charter_hash: BytesN<32>,
+        uri: String,
+    ) -> Option<u32> {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let result = if charter::is_group_activated(&env) {
+            Some(charter::propose_charter_update(&env, &admin, charter_hash, uri))
+        } else {
+            charter::apply_charter(&env, charter_hash, uri);
+            None
+        };
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        result
+    }
+
+    /// Record that `member` accepts charter `version`, which must be the
+    /// current version. Prospective members may acknowledge before joining.
+    pub fn acknowledge_charter(env: Env, member: Address, version: u32) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+        charter::acknowledge(&env, &member, version);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// View: the current charter, or `None` if the group has no charter.
+    pub fn get_group_charter(env: Env) -> Option<GroupCharter> {
+        charter::get_charter(&env)
+    }
+
+    /// View: whether `member` has acknowledged the current charter version.
+    /// Returns `true` for groups without a charter.
+    pub fn has_acknowledged_charter(env: Env, member: Address) -> bool {
+        match charter::get_charter(&env) {
+            Some(c) => charter::acknowledged_version(&env, &member) == c.version,
+            None => true,
+        }
+    }
+
+    /// View: the latest charter version acknowledged by `member` (0 = none).
+    pub fn get_acknowledged_charter_version(env: Env, member: Address) -> u32 {
+        charter::acknowledged_version(&env, &member)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ── Membership Succession ─────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Admin: number of consecutive missed contributions after which an
+    /// accepted successor may claim a member's slot (default 3).
+    pub fn set_succession_trigger_rounds(env: Env, admin: Address, rounds: u32) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if rounds == 0 {
+            panic_with_error!(&env, ExtError2::InvalidSuccessionTrigger);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey5::SuccessionTriggerRounds, &rounds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// View: the configured succession trigger (consecutive missed rounds).
+    pub fn get_succession_trigger_rounds(env: Env) -> u32 {
+        succession::trigger_rounds(&env)
+    }
+
+    /// Member designates `successor` to take over their membership if they
+    /// become inactive. Replaces any previous designation; the new successor
+    /// must accept via `accept_succession`. The successor must not already
+    /// be a member of this group.
+    pub fn designate_successor(env: Env, member: Address, successor: Address) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+        succession::designate(&env, &member, &successor);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Designated successor accepts the succession for `member`.
+    pub fn accept_succession(env: Env, successor: Address, member: Address) {
+        internals::check_not_paused(&env);
+        successor.require_auth();
+        succession::accept(&env, &successor, &member);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Accepted successor takes over `member`'s slot once the member has
+    /// missed at least `succession_trigger_rounds` consecutive contributions.
+    /// The successor inherits the member's payout slot, contribution state
+    /// and history, and outstanding catch-up debt.
+    pub fn claim_succession(env: Env, successor: Address, member: Address) {
+        internals::check_not_paused(&env);
+        internals::check_not_frozen(&env);
+        successor.require_auth();
+        succession::claim(&env, &successor, &member);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// View: `member`'s successor designation, if any.
+    pub fn get_successor(env: Env, member: Address) -> Option<SuccessorDesignation> {
+        succession::get_designation(&env, &member)
+    }
+
+    /// View: consecutive contributions `member` has missed.
+    pub fn get_consecutive_misses(env: Env, member: Address) -> u32 {
+        succession::consecutive_misses(&env, &member)
+    }
+
+    /// View: the member whose slot `successor` claimed, if any.
+    pub fn get_succeeded_from(env: Env, successor: Address) -> Option<Address> {
+        succession::predecessor(&env, &successor)
     }
 
     /// View: return clone-origin metadata for this group, or `None` when the

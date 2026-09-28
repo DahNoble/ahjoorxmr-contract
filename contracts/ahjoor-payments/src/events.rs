@@ -773,6 +773,38 @@ pub fn emit_fee_collected(
     .publish(e);
 }
 
+/// #980: Event: multi-payee split payment created.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SplitPaymentCreated {
+    pub payment_id: u32,
+    pub customer: Address,
+    pub amount: i128,
+    pub payee_count: u32,
+}
+
+pub fn emit_split_payment_created(
+    e: &Env,
+    payment_id: u32,
+    customer: Address,
+    amount: i128,
+    payee_count: u32,
+) {
+    SplitPaymentCreated { payment_id, customer, amount, payee_count }.publish(e);
+}
+
+/// #980: Event: a refund on a split payment was reversed across its payees.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SplitPaymentRefunded {
+    pub payment_id: u32,
+    pub refund_amount: i128,
+}
+
+pub fn emit_split_payment_refunded(e: &Env, payment_id: u32, refund_amount: i128) {
+    SplitPaymentRefunded { payment_id, refund_amount }.publish(e);
+}
+
 pub fn emit_payment_split_completed(e: &Env, payment_id: u32, splits: Vec<SplitTransfer>) {
     PaymentSplitCompleted { payment_id, splits }.publish(e);
 }

@@ -145,6 +145,7 @@ pub enum ProposalType {
     MaxMembersUpdate = 3,
     Reinstatement = 4, // #218
     MemberFreeze = 5,  // Member-initiated emergency freeze
+    CharterUpdate = 6, // Replace the group charter after activation
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

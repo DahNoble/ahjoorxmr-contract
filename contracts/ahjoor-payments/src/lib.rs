@@ -101,6 +101,8 @@ const DEFAULT_MIN_COLLATERAL: i128 = 1_000_000; // 1 USDC (7 decimals)
 const DEFAULT_MAX_TIP_BPS: u32 = 3_000;
 /// Maximum number of beneficiaries in a tip split configuration (#370)
 const MAX_TIP_SPLIT_BENEFICIARIES: u32 = 10;
+/// #980: default cap on the number of payees in a multi-payee split payment.
+const DEFAULT_MAX_SPLIT_PAYEES: u32 = 10;
 /// Maximum number of historical notification keys to retain (#377)
 const MAX_NOTIFICATION_KEY_HISTORY: u32 = 5;
 /// Default notification key overlap window in seconds: 30 days (#377)
@@ -409,6 +411,25 @@ pub struct SplitTransfer {
     pub recipient: Address,
     pub bps: u32,
     pub amount: i128,
+}
+
+/// #980: one payee of a multi-payee split payment created via
+/// `create_split_payment`. Every payee must be an approved merchant.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitPayee {
+    pub payee: Address,
+    /// Share of the payment in basis points (all payees sum to 10_000).
+    pub bps: u32,
+    /// Gross share of the payment amount (`amount * bps / 10_000`; the
+    /// first payee also receives the rounding dust).
+    pub gross: i128,
+    /// Portion of this payee's gross share refunded to the customer.
+    pub refunded: i128,
+    /// Protocol fee charged on this payee's share at settlement.
+    pub fee: i128,
+    /// Amount transferred to this payee at settlement.
+    pub paid: i128,
 }
 
 #[contracttype]
@@ -1113,6 +1134,10 @@ pub enum DataKey3 {
     InvoiceCountCap(Address),
     /// #804: rolling invoice-count window state for a merchant
     InvoiceCountWindow(Address),
+    /// #980: Persistent: payment_id -> Vec<SplitPayee> for multi-payee split payments
+    SplitPayees(u32),
+    /// #980: Instance: maximum number of payees in a split payment
+    MaxSplitPayees,
 }
 
 mod events;
@@ -2105,7 +2130,28 @@ impl AhjoorPaymentsContract {
         let client = token::Client::new(&env, &payment.token);
         let old_status = payment.status;
 
-        if release_to_merchant {
+        let is_split_payment = env
+            .storage()
+            .persistent()
+            .has(&DataKey3::SplitPayees(payment_id));
+
+        if release_to_merchant && is_split_payment {
+            // #980: pay every split payee its remaining share now; batch
+            // settlement to a single merchant cannot represent a split.
+            let remaining = payment.amount - payment.refunded_amount;
+            let rolling = Self::rolling_merchant_volume(&env, &payment.merchant);
+            let fee_bps = Self::fee_bps_for_volume(&env, rolling + remaining);
+            Self::settle_split_payment(&env, payment_id, &payment, fee_bps);
+            payment.status = PaymentStatus::Completed;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Settled(payment_id), &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Settled(payment_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        } else if release_to_merchant {
             payment.status = PaymentStatus::Completed;
             env.storage()
                 .persistent()
@@ -2121,6 +2167,11 @@ impl AhjoorPaymentsContract {
             // issued), cover the shortfall by slashing merchant collateral (#129).
             let already_refunded = payment.refunded_amount;
             let owed_to_customer = payment.amount - already_refunded;
+
+            // #980: reverse the remaining balance proportionally across split payees.
+            if is_split_payment && owed_to_customer > 0 {
+                Self::allocate_split_refund(&env, payment_id, owed_to_customer);
+            }
 
             if owed_to_customer > 0 {
                 // Try to cover from escrow (the remaining escrowed balance).
@@ -2139,7 +2190,13 @@ impl AhjoorPaymentsContract {
             // For simplicity we slash collateral equal to the full disputed amount
             // only when the payment token is the collateral token (USDC), so the
             // slash covers the exact economic loss.
-            let usdc_token: Option<Address> = env.storage().instance().get(&DataKey::UsdcToken);
+            // Split payments (#980) have no single responsible merchant, and
+            // the refund above is fully covered from escrow, so no slash.
+            let usdc_token: Option<Address> = if is_split_payment {
+                None
+            } else {
+                env.storage().instance().get(&DataKey::UsdcToken)
+            };
             if let Some(ref usdc) = usdc_token {
                 if payment.token == *usdc && owed_to_customer > 0 {
                     let collateral_key = DataKey::MerchantCollateral(payment.merchant.clone());
@@ -4651,6 +4708,8 @@ impl AhjoorPaymentsContract {
         );
 
         payment.refunded_amount += refund_amount;
+        // #980: reverse the refund proportionally across split payees.
+        Self::allocate_split_refund(&env, payment_id, refund_amount);
 
         // If fully refunded, mark as Refunded
         if payment.refunded_amount >= payment.amount {
@@ -4684,6 +4743,131 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // --- Multi-payee split payments (#980) ---
+
+    /// Create a payment whose amount is split across several approved
+    /// merchants by basis points (e.g. seller + platform + affiliate).
+    ///
+    /// `payees` bps must total exactly 10_000, each payee must be an approved
+    /// merchant, and the list is capped by `set_max_split_payees` (default 10).
+    /// On completion each payee receives `amount * bps / 10_000` minus its
+    /// share of the protocol fee; rounding dust goes to the first payee.
+    /// Refunds and customer-favoured dispute resolutions are reversed
+    /// proportionally across payees.
+    pub fn create_split_payment(
+        env: Env,
+        customer: Address,
+        payees: Vec<(Address, u32)>,
+        amount: i128,
+        token: Address,
+        reference: String,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        // Customer auth is enforced by `create_payment_with_expiry` below.
+
+        if payees.is_empty() {
+            panic!("Split payees cannot be empty");
+        }
+        let max_payees = Self::get_max_split_payees(env.clone());
+        if payees.len() > max_payees {
+            panic!("Too many split payees");
+        }
+        if amount <= 0 {
+            panic!("Payment amount must be positive");
+        }
+
+        let mut total_bps: u32 = 0;
+        let mut seen: Vec<Address> = Vec::new(&env);
+        let mut recipients: Vec<SplitRecipient> = Vec::new(&env);
+        for (payee, bps) in payees.iter() {
+            if bps == 0 {
+                panic!("split payee bps must be positive");
+            }
+            if seen.contains(&payee) {
+                panic!("Duplicate split payee");
+            }
+            Self::require_merchant_approved(&env, &payee);
+            total_bps = total_bps.checked_add(bps).expect("split bps overflow");
+            seen.push_back(payee.clone());
+            recipients.push_back(SplitRecipient { recipient: payee, bps });
+        }
+        if total_bps != 10_000 {
+            panic!("split payees must sum to 10000 bps");
+        }
+
+        let first_payee = payees.get(0).unwrap().0;
+        let payment_id = Self::create_payment_with_expiry(
+            env.clone(),
+            customer.clone(),
+            first_payee,
+            amount,
+            token,
+            Some(reference),
+            None,
+            Some(recipients),
+            None,
+            None,
+            None,
+        );
+
+        // Gross shares; rounding dust goes to the first payee.
+        let mut split_payees: Vec<SplitPayee> = Vec::new(&env);
+        let mut allocated: i128 = 0;
+        for (payee, bps) in payees.iter() {
+            let gross = (amount * bps as i128) / 10_000;
+            allocated += gross;
+            split_payees.push_back(SplitPayee {
+                payee,
+                bps,
+                gross,
+                refunded: 0,
+                fee: 0,
+                paid: 0,
+            });
+        }
+        let dust = amount - allocated;
+        if dust > 0 {
+            let mut first = split_payees.get(0).unwrap();
+            first.gross += dust;
+            split_payees.set(0, first);
+        }
+        Self::save_split_payees(&env, payment_id, &split_payees);
+
+        events::emit_split_payment_created(&env, payment_id, customer, amount, payees.len());
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        payment_id
+    }
+
+    /// Admin sets the maximum number of payees allowed in a split payment.
+    pub fn set_max_split_payees(env: Env, admin: Address, max_payees: u32) {
+        Self::require_admin(&env, &admin);
+        if max_payees == 0 {
+            panic!("max_payees must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey3::MaxSplitPayees, &max_payees);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Maximum number of payees in a split payment (default 10).
+    pub fn get_max_split_payees(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey3::MaxSplitPayees)
+            .unwrap_or(DEFAULT_MAX_SPLIT_PAYEES)
+    }
+
+    /// Payees of a split payment with their gross share, refunded portion,
+    /// fee and payout. Empty for payments that are not split payments.
+    pub fn get_split_payees(env: Env, payment_id: u32) -> Vec<SplitPayee> {
+        Self::get_split_payees_internal(&env, payment_id).unwrap_or(Vec::new(&env))
     }
 
     // --- Merchant Allowlist (#58) ---
@@ -6844,15 +7028,24 @@ impl AhjoorPaymentsContract {
             payment.amount,
         );
 
+        // #980: multi-payee split payments settle each payee in the payment token.
+        let is_split_payment = env
+            .storage()
+            .persistent()
+            .has(&DataKey3::SplitPayees(payment_id));
+
         // --- Token Swap: Convert payment token to merchant's preferred token ---
         let mut final_token = payment.token.clone();
         let mut final_amount = payment.amount;
 
         // Check if swap is needed and possible
-        let preferred_token: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::PreferredToken(payment.merchant.clone()));
+        let preferred_token: Option<Address> = if is_split_payment {
+            None
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::PreferredToken(payment.merchant.clone()))
+        };
 
         if let Some(preferred) = preferred_token {
             if payment.token != preferred {
@@ -6946,6 +7139,14 @@ impl AhjoorPaymentsContract {
         let rolling_before = Self::rolling_merchant_volume(env, &payment.merchant);
         let projected_volume = rolling_before + final_amount;
         let applied_fee_bps = Self::fee_bps_for_volume(env, projected_volume);
+
+        if is_split_payment {
+            let (_split_fee, split_net) =
+                Self::settle_split_payment(env, payment_id, payment, applied_fee_bps);
+            Self::finish_finalize_payment(env, payment_id, payment, split_net);
+            return;
+        }
+
         let fee_amount = (final_amount * applied_fee_bps as i128) / 10_000;
         let net_amount = final_amount - fee_amount;
 
@@ -6975,6 +7176,13 @@ impl AhjoorPaymentsContract {
             events::emit_payment_split_completed(env, payment_id, split_transfers);
         }
 
+        Self::finish_finalize_payment(env, payment_id, payment, net_amount);
+    }
+
+    /// Status transition, receipt, stats and tier bookkeeping shared by the
+    /// single-merchant and multi-payee (#980) settlement paths of
+    /// `finalize_payment`, run after funds have been distributed.
+    fn finish_finalize_payment(env: &Env, payment_id: u32, payment: &mut Payment, net_amount: i128) {
         let old_status = payment.status;
 
         // Check if cooling-off is enabled for this payment (#309)
@@ -7053,8 +7261,16 @@ impl AhjoorPaymentsContract {
         Self::inc_volume_bucket(env, &payment.token, net_amount);
         Self::inc_merchant_volume_bucket(env, &payment.merchant, original_amount);
 
-        // Auto-enqueue completed payment into merchant's withdrawal queue (#126)
-        Self::enqueue_withdrawal(env, &payment.merchant, payment_id, net_amount);
+        // Auto-enqueue completed payment into merchant's withdrawal queue (#126).
+        // Multi-payee split payments (#980) are paid out to every payee at
+        // settlement, so they are not queued against the first payee.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey3::SplitPayees(payment_id))
+        {
+            Self::enqueue_withdrawal(env, &payment.merchant, payment_id, net_amount);
+        }
 
         let rolling_after = Self::rolling_merchant_volume(env, &payment.merchant);
         let new_tier_bps = Self::fee_bps_for_volume(env, rolling_after);
@@ -7095,6 +7311,125 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // --- Multi-payee split payments (#980) ---
+
+    fn get_split_payees_internal(env: &Env, payment_id: u32) -> Option<Vec<SplitPayee>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::SplitPayees(payment_id))
+    }
+
+    fn save_split_payees(env: &Env, payment_id: u32, payees: &Vec<SplitPayee>) {
+        let key = DataKey3::SplitPayees(payment_id);
+        env.storage().persistent().set(&key, payees);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+
+    /// Spreads `refund_amount` over the payees in proportion to each payee's
+    /// remaining (gross - refunded) share and records it on each payee.
+    /// Rounding dust goes to the first payee that still has room, so no payee
+    /// is ever refunded more than its gross share.
+    fn allocate_split_refund(env: &Env, payment_id: u32, refund_amount: i128) {
+        let payees = match Self::get_split_payees_internal(env, payment_id) {
+            Some(p) => p,
+            None => return,
+        };
+        let mut total_remaining: i128 = 0;
+        for p in payees.iter() {
+            total_remaining += p.gross - p.refunded;
+        }
+        if total_remaining <= 0 || refund_amount <= 0 {
+            return;
+        }
+
+        let mut shares: Vec<i128> = Vec::new(env);
+        let mut allocated: i128 = 0;
+        for p in payees.iter() {
+            let share = refund_amount * (p.gross - p.refunded) / total_remaining;
+            shares.push_back(share);
+            allocated += share;
+        }
+        let mut dust = refund_amount - allocated;
+
+        let mut updated: Vec<SplitPayee> = Vec::new(env);
+        for i in 0..payees.len() {
+            let mut p = payees.get(i).unwrap();
+            let mut share = shares.get(i).unwrap();
+            if dust > 0 {
+                let room = (p.gross - p.refunded) - share;
+                let extra = dust.min(room);
+                share += extra;
+                dust -= extra;
+            }
+            p.refunded += share;
+            updated.push_back(p);
+        }
+        Self::save_split_payees(env, payment_id, &updated);
+        events::emit_split_payment_refunded(env, payment_id, refund_amount);
+    }
+
+    /// Pays every payee its remaining share minus its share of the protocol
+    /// fee (`fee_bps`), and sends the summed fee to the fee recipient.
+    /// Payouts plus fees always equal `amount - refunded` exactly.
+    /// Returns `(total_fee, total_paid)`.
+    fn settle_split_payment(
+        env: &Env,
+        payment_id: u32,
+        payment: &Payment,
+        fee_bps: u32,
+    ) -> (i128, i128) {
+        let payees = Self::get_split_payees_internal(env, payment_id)
+            .expect("Split payees not found");
+        let token_client = token::Client::new(env, &payment.token);
+
+        let mut total_fee: i128 = 0;
+        let mut total_paid: i128 = 0;
+        let mut updated: Vec<SplitPayee> = Vec::new(env);
+        let mut transfers: Vec<SplitTransfer> = Vec::new(env);
+        for p in payees.iter() {
+            let mut p = p;
+            let remaining = p.gross - p.refunded;
+            let fee = (remaining * fee_bps as i128) / 10_000;
+            let paid = remaining - fee;
+            if paid > 0 {
+                token_client.transfer(&env.current_contract_address(), &p.payee, &paid);
+            }
+            total_fee += fee;
+            total_paid += paid;
+            p.fee = fee;
+            p.paid = paid;
+            transfers.push_back(SplitTransfer {
+                recipient: p.payee.clone(),
+                bps: p.bps,
+                amount: paid,
+            });
+            updated.push_back(p);
+        }
+
+        if total_fee > 0 {
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .expect("Fee recipient not configured");
+            token_client.transfer(&env.current_contract_address(), &fee_recipient, &total_fee);
+            events::emit_fee_collected(
+                env,
+                payment_id,
+                total_fee,
+                fee_recipient,
+                payment.token.clone(),
+            );
+            Self::accrue_referral_commission(env, &payment.merchant, payment_id, total_fee);
+        }
+
+        Self::save_split_payees(env, payment_id, &updated);
+        events::emit_payment_split_completed(env, payment_id, transfers);
+        (total_fee, total_paid)
     }
 
     fn distribute_net_payment(
@@ -11100,6 +11435,8 @@ mod test_invoice_cap;
 
 #[cfg(test)]
 mod test_customer_cancel;
+#[cfg(test)]
+mod test_split_payment;
 
 #[cfg(test)]
 mod test_recurring_payment;
