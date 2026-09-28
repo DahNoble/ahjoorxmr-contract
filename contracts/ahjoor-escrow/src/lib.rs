@@ -331,6 +331,12 @@ pub enum EscrowErrorExt5 {
     EscrowNotAbandonable = 10,
     /// #797/#800: deposit amount must be positive.
     DepositAmountMustBePositive = 11,
+    /// The escrow's protocol fee has already been sponsored.
+    FeeAlreadySponsored = 12,
+    /// There is no protocol fee to sponsor for this escrow (fee is zero).
+    NoProtocolFeeToSponsor = 13,
+    /// The escrow is in a terminal state and cannot be sponsored.
+    EscrowNotSponsorable = 14,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -873,6 +879,24 @@ pub enum DataKey3 {
     FundingDeadlineLedger(u32),
     /// #797: whether any principal has been deposited
     PrincipalFunded(u32),
+    /// Third-party protocol fee sponsorship for an escrow
+    FeeSponsorship(u32),
+}
+
+/// A third party's pre-funded protocol fee for a specific escrow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeSponsorship {
+    pub sponsor: Address,
+    /// Amount the sponsor transferred into the contract.
+    pub amount: i128,
+    /// Escrow amount the fee was computed against at sponsorship time.
+    pub escrow_amount: i128,
+    /// Protocol fee bps in effect at sponsorship time.
+    pub fee_bps: u32,
+    pub sponsored_at: u64,
+    /// True once the sponsorship has been consumed or returned.
+    pub settled: bool,
 }
 
 /// #357: On-chain reputation record for an inspector.
@@ -2436,6 +2460,7 @@ impl AhjoorEscrowContract {
         let total = escrow.amount;
 
         Self::transfer_to_sellers(&env, &escrow, total, escrow_id);
+        Self::settle_fee_sponsorship_on_release(&env, escrow_id, &escrow.token);
 
         // #237: Return seller collateral on buyer-approved release
         let collateral: i128 = env
@@ -2861,6 +2886,9 @@ impl AhjoorEscrowContract {
         } else {
             EscrowStatus::PartiallyReleased
         };
+        if escrow.amount == 0 {
+            Self::settle_fee_sponsorship_on_release(&env, escrow_id, &escrow.token);
+        }
 
         env.storage()
             .persistent()
@@ -3440,7 +3468,18 @@ impl AhjoorEscrowContract {
             .instance()
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0);
-        let protocol_fee = (escrow.amount * fee_bps as i128) / 10_000;
+        let full_protocol_fee = (escrow.amount * fee_bps as i128) / 10_000;
+
+        // Fee sponsorship: a full refund to the buyer returns the sponsorship;
+        // otherwise the sponsorship covers the fee and only any shortfall is
+        // deducted from the escrowed amount.
+        let sponsored_fee = if buyer_percent == 100 {
+            Self::refund_fee_sponsorship(env, escrow_id, &escrow.token);
+            0
+        } else {
+            Self::consume_fee_sponsorship(env, escrow_id, &escrow.token, full_protocol_fee)
+        };
+        let protocol_fee = full_protocol_fee - sponsored_fee;
 
         if protocol_fee > 0 {
             let token = escrow.token.clone();
@@ -3820,6 +3859,7 @@ impl AhjoorEscrowContract {
                 &escrow.seller,
                 &escrow.amount,
             );
+            Self::settle_fee_sponsorship_on_release(&env, escrow_id, &escrow.token);
             escrow.status = EscrowStatus::Released;
             
             // #578: Update active dispute count
@@ -3828,6 +3868,7 @@ impl AhjoorEscrowContract {
             Self::record_status_history(&env, escrow_id, EscrowStatus::Released);
         } else {
             Self::transfer_to_buyers(&env, &escrow, escrow.amount, escrow_id);
+            Self::refund_fee_sponsorship(&env, escrow_id, &escrow.token);
             escrow.status = EscrowStatus::Refunded;
             
             // #578: Update active dispute count
@@ -4165,6 +4206,150 @@ impl AhjoorEscrowContract {
         (fee_bps, fee_recipient)
     }
 
+    /// Sponsor the protocol fee for `escrow_id`. Transfers the expected fee
+    /// (at the current fee rate) from `sponsor` into the contract so the fee is
+    /// not deducted from the escrowed amount. An escrow can be sponsored once.
+    pub fn sponsor_escrow_fee(env: Env, sponsor: Address, escrow_id: u32) -> i128 {
+        Self::require_not_paused(&env);
+        sponsor.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if Self::is_terminal_escrow_status(escrow.status) {
+            panic_with_error!(&env, EscrowErrorExt5::EscrowNotSponsorable);
+        }
+
+        let key = DataKey3::FeeSponsorship(escrow_id);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, EscrowErrorExt5::FeeAlreadySponsored);
+        }
+
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
+        let amount = (escrow.amount * fee_bps as i128) / 10_000;
+        if amount <= 0 {
+            panic_with_error!(&env, EscrowErrorExt5::NoProtocolFeeToSponsor);
+        }
+
+        let client = token::Client::new(&env, &escrow.token);
+        client.transfer(&sponsor, &env.current_contract_address(), &amount);
+
+        let sponsorship = FeeSponsorship {
+            sponsor: sponsor.clone(),
+            amount,
+            escrow_amount: escrow.amount,
+            fee_bps,
+            sponsored_at: env.ledger().timestamp(),
+            settled: false,
+        };
+        env.storage().persistent().set(&key, &sponsorship);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_escrow_fee_sponsored(&env, escrow_id, sponsor, amount);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        amount
+    }
+
+    /// View: fee sponsorship recorded for `escrow_id`, if any.
+    pub fn get_fee_sponsorship(env: Env, escrow_id: u32) -> Option<FeeSponsorship> {
+        env.storage()
+            .persistent()
+            .get(&DataKey3::FeeSponsorship(escrow_id))
+    }
+
+    fn active_fee_sponsorship(env: &Env, escrow_id: u32) -> Option<FeeSponsorship> {
+        env.storage()
+            .persistent()
+            .get::<DataKey3, FeeSponsorship>(&DataKey3::FeeSponsorship(escrow_id))
+            .filter(|s| !s.settled)
+    }
+
+    fn mark_sponsorship_settled(env: &Env, escrow_id: u32, mut sponsorship: FeeSponsorship) {
+        sponsorship.settled = true;
+        let key = DataKey3::FeeSponsorship(escrow_id);
+        env.storage().persistent().set(&key, &sponsorship);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    /// Pays up to `fee_due` of protocol fee out of the escrow's sponsorship,
+    /// accruing it as protocol fees. Any unused sponsorship (e.g. after a fee
+    /// decrease) is returned to the sponsor. Returns the amount covered; the
+    /// caller falls back to its normal deduction for any shortfall.
+    fn consume_fee_sponsorship(env: &Env, escrow_id: u32, token: &Address, fee_due: i128) -> i128 {
+        let sponsorship = match Self::active_fee_sponsorship(env, escrow_id) {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        let covered = fee_due.max(0).min(sponsorship.amount);
+        let returned = sponsorship.amount - covered;
+
+        if covered > 0 {
+            let mut accrued: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey2::AccruedFees(token.clone()))
+                .unwrap_or(0);
+            accrued = accrued.checked_add(covered).expect("AccruedFees overflow");
+            env.storage()
+                .instance()
+                .set(&DataKey2::AccruedFees(token.clone()), &accrued);
+            events::emit_protocol_fee_paid(env, escrow_id, covered, env.current_contract_address());
+        }
+        if returned > 0 {
+            let client = token::Client::new(env, token);
+            client.transfer(&env.current_contract_address(), &sponsorship.sponsor, &returned);
+        }
+
+        events::emit_escrow_fee_sponsorship_settled(
+            env,
+            escrow_id,
+            sponsorship.sponsor.clone(),
+            covered,
+            returned,
+        );
+        Self::mark_sponsorship_settled(env, escrow_id, sponsorship);
+        covered
+    }
+
+    /// Settles a sponsorship on release: the fee at the current rate is taken
+    /// from the sponsorship so the seller receives the full amount.
+    fn settle_fee_sponsorship_on_release(env: &Env, escrow_id: u32, token: &Address) {
+        if let Some(sponsorship) = Self::active_fee_sponsorship(env, escrow_id) {
+            let fee_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProtocolFeeBps)
+                .unwrap_or(0);
+            let fee_due = (sponsorship.escrow_amount * fee_bps as i128) / 10_000;
+            Self::consume_fee_sponsorship(env, escrow_id, token, fee_due);
+        }
+    }
+
+    /// Returns the full sponsored amount to the sponsor when the escrow is
+    /// cancelled or fully refunded.
+    fn refund_fee_sponsorship(env: &Env, escrow_id: u32, token: &Address) {
+        Self::consume_fee_sponsorship(env, escrow_id, token, 0);
+    }
+
     /// Get accumulated protocol fees for a given token.
     /// Returns the amount of fees accrued and awaiting withdrawal.
     pub fn get_accrued_fees(env: Env, token: Address) -> i128 {
@@ -4249,6 +4434,7 @@ impl AhjoorEscrowContract {
         }
 
         Self::transfer_to_sellers(&env, &escrow, escrow.amount, escrow_id);
+        Self::settle_fee_sponsorship_on_release(&env, escrow_id, &escrow.token);
         escrow.status = EscrowStatus::Released;
         Self::record_status_history(&env, escrow_id, EscrowStatus::Released);
 
@@ -4297,6 +4483,7 @@ impl AhjoorEscrowContract {
         escrow.buyer.require_auth();
 
         Self::transfer_to_buyers(&env, &escrow, escrow.amount, escrow_id);
+        Self::refund_fee_sponsorship(&env, escrow_id, &escrow.token);
 
         escrow.status = EscrowStatus::Refunded;
         Self::record_status_history(&env, escrow_id, EscrowStatus::Refunded);
@@ -5440,6 +5627,7 @@ impl AhjoorEscrowContract {
         if escrow.status == EscrowStatus::Disputed || escrow.status == EscrowStatus::PartiallyDisputed { panic_with_error!(&env, EscrowErrorExt2::DisputeActive); }
         if escrow.status != EscrowStatus::Active { panic_with_error!(&env, EscrowErrorExt2::EscrowNotActive); }
         Self::transfer_to_buyers(&env, &escrow, escrow.amount, escrow_id);
+        Self::refund_fee_sponsorship(&env, escrow_id, &escrow.token);
         escrow.status = EscrowStatus::Refunded;
         Self::record_status_history(&env, escrow_id, EscrowStatus::Refunded);
         env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
@@ -6276,6 +6464,7 @@ impl AhjoorEscrowContract {
 
         // #797: Refund creation bond to buyer on mutual cancellation.
         Self::refund_creation_bond_to_buyer(&env, escrow_id, &escrow);
+        Self::refund_fee_sponsorship(&env, escrow_id, &escrow.token);
 
         escrow.status = EscrowStatus::Refunded;
         Self::record_status_history(&env, escrow_id, EscrowStatus::Refunded);
@@ -10141,3 +10330,6 @@ mod test_conditional_release;
 
 #[cfg(test)]
 mod test_multi_seller;
+
+#[cfg(test)]
+mod test_fee_sponsorship;

@@ -1,8 +1,8 @@
 #![no_std]
 use ahjoor_token_whitelist::TokenWhitelistClient;
 use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, token, Address, BytesN, Env, String,
-    Symbol, Vec,
+    contract, contractevent, contractimpl, contracttype, token, Address, BytesN, Env, Map,
+    String, Symbol, Vec,
 };
 
 // --- Storage TTL Constants ---
@@ -144,6 +144,8 @@ pub struct Refund {
     pub auto_approval_deadline_ledger: u32,
     /// Whether merchant has requested an extension (#335)
     pub extension_requested: bool,
+    /// Merchant restocking fee deducted when the refund was approved (0 = none).
+    pub restocking_fee: i128,
 }
 
 #[contracttype]
@@ -333,6 +335,22 @@ pub enum DataKey2 {
     EvidenceHash(u32, Address),
     /// Ordered history of counter-offer rounds for a refund (Vec<CounterOffer>)
     CounterOfferHistory(u32),
+
+    // --- Feature: Merchant Restocking Fee ---
+    /// Admin-set cap on any merchant restocking fee, in basis points.
+    MaxRestockingFeeBps,
+    /// Merchant default restocking fee in basis points.
+    MerchantDefaultRestockingFee(Address),
+    /// Merchant restocking fee in basis points for a specific reason code.
+    MerchantReasonRestockingFee(Address, u32),
+
+    // --- Feature: Product Recall Events ---
+    /// Monotonic counter for recall IDs.
+    RecallCounter,
+    /// Recall record keyed by recall ID.
+    Recall(u32),
+    /// Whether a payment has been claimed under a recall: (recall_id, payment_id) → bool.
+    RecallClaimed(u32, u32),
 }
 
 mod events;
@@ -348,6 +366,49 @@ pub struct RefundPolicy {
     /// Payment tags that are excluded from refunds (empty = none excluded)
     pub excluded_tags: Vec<Symbol>,
 }
+
+/// Refund policy as exported to customers, including the merchant's
+/// restocking fee configuration so it is visible before requesting a refund.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportedRefundPolicy {
+    /// Ledgers within which a refund can be requested
+    pub eligible_window_ledgers: u32,
+    /// Maximum refund amount as basis points (0-10000)
+    pub max_refund_bps: u32,
+    /// Payment tags that are excluded from refunds (empty = none excluded)
+    pub excluded_tags: Vec<Symbol>,
+    /// Merchant default restocking fee in basis points (0 = none).
+    pub default_restocking_fee_bps: u32,
+    /// Reason-specific restocking fees: reason_code → fee in basis points.
+    pub restocking_fee_by_reason: Map<u32, u32>,
+}
+
+/// A merchant-declared product recall covering a set of settled payments.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Recall {
+    pub recall_id: u32,
+    pub merchant: Address,
+    pub recall_id_hash: BytesN<32>,
+    /// payment_id → refund amount claimable for that payment.
+    pub claim_amounts: Map<u32, i128>,
+    pub refund_bps: u32,
+    pub claim_deadline: u64,
+    pub token: Address,
+    /// Total reserve locked to cover the recall.
+    pub locked_amount: i128,
+    /// Total amount paid out to customers so far.
+    pub claimed_amount: i128,
+    pub declared_at: u64,
+    pub closed: bool,
+}
+
+/// Highest valid refund reason code (codes are 0-4).
+const MAX_REASON_CODE: u32 = 4;
+
+/// Default cap on merchant restocking fees: 2_000 bps = 20%.
+const DEFAULT_MAX_RESTOCKING_FEE_BPS: u32 = 2_000;
 
 /// Counter-offer record stored during negotiation.
 #[contracttype]
@@ -853,6 +914,7 @@ impl AhjoorRefundContract {
                 env.ledger().sequence() + auto_deadline_window
             },
             extension_requested: false,
+            restocking_fee: 0,
         };
         env.storage()
             .persistent()
@@ -997,13 +1059,15 @@ impl AhjoorRefundContract {
 
         refund.status = RefundStatus::Approved;
         refund.approved_at = Some(env.ledger().timestamp());
+        Self::apply_restocking_fee(&env, &mut refund);
+        let net_amount = refund.amount - refund.restocking_fee;
 
         // #274: Draw from merchant reserve first
         let reserve_key = DataKey::MerchantReserve(refund.merchant.clone());
         let reserve_balance: i128 = env.storage().persistent().get(&reserve_key).unwrap_or(0);
         if reserve_balance > 0 {
-            let draw = if reserve_balance >= refund.amount {
-                refund.amount
+            let draw = if reserve_balance >= net_amount {
+                net_amount
             } else {
                 reserve_balance
             };
@@ -1040,7 +1104,13 @@ impl AhjoorRefundContract {
         if is_delegate {
             events::emit_refund_approved_by_delegate(&env, refund_id, admin.clone());
         }
-        events::emit_refund_approved(&env, refund_id, admin, refund.approved_at.unwrap());
+        events::emit_refund_approved(
+            &env,
+            refund_id,
+            admin,
+            refund.approved_at.unwrap(),
+            refund.restocking_fee,
+        );
 
         env.storage()
             .instance()
@@ -1214,6 +1284,7 @@ impl AhjoorRefundContract {
             origin_contract: None,
             auto_approval_deadline_ledger: 0,
             extension_requested: false,
+            restocking_fee: 0,
         };
 
         env.storage()
@@ -2666,6 +2737,7 @@ impl AhjoorRefundContract {
             origin_contract: None,
             auto_approval_deadline_ledger: 0,
             extension_requested: false,
+            restocking_fee: 0,
         };
 
         env.storage()
@@ -3303,13 +3375,16 @@ impl AhjoorRefundContract {
             .get(&DataKey::RefundFeeBps)
             .unwrap_or(0);
 
+        // Restocking fee (if any) was already released to the merchant on approval.
+        let refundable_amount = refund.amount - refund.restocking_fee;
+
         let fee_amount = if fee_bps > 0 {
-            (refund.amount as u128 * fee_bps as u128 / 10_000) as i128
+            (refundable_amount as u128 * fee_bps as u128 / 10_000) as i128
         } else {
             0
         };
 
-        let customer_amount = refund.amount - fee_amount;
+        let customer_amount = refundable_amount - fee_amount;
 
         let client = token::Client::new(env, &refund.token);
         if customer_amount > 0 {
@@ -3939,6 +4014,7 @@ impl AhjoorRefundContract {
                 Some(mut refund) if refund.status == RefundStatus::Requested => {
                     refund.status = RefundStatus::Approved;
                     refund.approved_at = Some(now);
+                    Self::apply_restocking_fee(&env, &mut refund);
                     env.storage()
                         .persistent()
                         .set(&DataKey::Refund(refund_id), &refund);
@@ -3950,7 +4026,13 @@ impl AhjoorRefundContract {
                     Self::remove_from_pending_queue(&env, refund_id);
                     Self::decrement_fraud_score(&env, &refund.customer);
                     Self::update_stats_on_approve(&env, &refund.merchant);
-                    events::emit_refund_approved(&env, refund_id, admin.clone(), now);
+                    events::emit_refund_approved(
+                        &env,
+                        refund_id,
+                        admin.clone(),
+                        now,
+                        refund.restocking_fee,
+                    );
                     processed.push_back(refund_id);
                 }
                 _ => {
@@ -5380,6 +5462,7 @@ impl AhjoorRefundContract {
             origin_contract: Some(origin_contract.clone()),
             auto_approval_deadline_ledger: 0,
             extension_requested: false,
+            restocking_fee: 0,
         };
 
         env.storage()
@@ -6062,8 +6145,419 @@ impl AhjoorRefundContract {
     /// Returns the full currently active `RefundPolicy` for a merchant (#583):
     /// the merchant's own published policy if set, else the admin global default,
     /// else the hardcoded fallback — the same resolution used to enforce refunds.
-    pub fn export_refund_policy(env: Env, merchant: Address) -> RefundPolicy {
-        Self::refund_policy_for(&env, &merchant)
+    pub fn export_refund_policy(env: Env, merchant: Address) -> ExportedRefundPolicy {
+        let policy = Self::refund_policy_for(&env, &merchant);
+        let default_restocking_fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::MerchantDefaultRestockingFee(merchant.clone()))
+            .unwrap_or(0);
+        let mut restocking_fee_by_reason: Map<u32, u32> = Map::new(&env);
+        for reason_code in 0..=MAX_REASON_CODE {
+            if let Some(fee_bps) = env
+                .storage()
+                .persistent()
+                .get::<DataKey2, u32>(&DataKey2::MerchantReasonRestockingFee(
+                    merchant.clone(),
+                    reason_code,
+                ))
+            {
+                restocking_fee_by_reason.set(reason_code, fee_bps);
+            }
+        }
+        ExportedRefundPolicy {
+            eligible_window_ledgers: policy.eligible_window_ledgers,
+            max_refund_bps: policy.max_refund_bps,
+            excluded_tags: policy.excluded_tags,
+            default_restocking_fee_bps,
+            restocking_fee_by_reason,
+        }
+    }
+
+    // --- Feature: Merchant Restocking Fee ---
+
+    /// Admin sets the maximum restocking fee any merchant may configure.
+    pub fn set_max_restocking_fee_bps(env: Env, admin: Address, max_bps: u32) {
+        Self::require_admin(&env, &admin);
+        if max_bps > 10_000 {
+            panic!("MaxRestockingFeeBpsCannotExceed100Percent");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey2::MaxRestockingFeeBps, &max_bps);
+        events::emit_max_restocking_fee_set(&env, max_bps);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the admin cap on restocking fees (default 2_000 bps).
+    pub fn get_max_restocking_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey2::MaxRestockingFeeBps)
+            .unwrap_or(DEFAULT_MAX_RESTOCKING_FEE_BPS)
+    }
+
+    /// Merchant sets a restocking fee deducted from approved refunds.
+    /// `reason_code = None` sets the merchant default; `Some(code)` sets a
+    /// reason-specific fee that overrides the default. A fee of 0 clears it.
+    pub fn set_restocking_fee(
+        env: Env,
+        merchant: Address,
+        reason_code: Option<u32>,
+        fee_bps: u32,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if fee_bps > Self::get_max_restocking_fee_bps(env.clone()) {
+            panic!("RestockingFeeExceedsCap");
+        }
+
+        let key = match reason_code {
+            Some(code) => {
+                if code > MAX_REASON_CODE {
+                    panic!("Invalid reason code: must be 0-4");
+                }
+                DataKey2::MerchantReasonRestockingFee(merchant.clone(), code)
+            }
+            None => DataKey2::MerchantDefaultRestockingFee(merchant.clone()),
+        };
+
+        if fee_bps == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &fee_bps);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        events::emit_restocking_fee_set(&env, merchant, reason_code, fee_bps);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the restocking fee (bps) that would apply to a refund for
+    /// `merchant` with `reason_code`: the reason-specific fee if set, else the
+    /// merchant default, else 0.
+    pub fn get_restocking_fee_bps(env: Env, merchant: Address, reason_code: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::MerchantReasonRestockingFee(
+                merchant.clone(),
+                reason_code,
+            ))
+            .or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get(&DataKey2::MerchantDefaultRestockingFee(merchant))
+            })
+            .unwrap_or(0)
+    }
+
+    /// Computes the restocking fee for a refund being approved, records it on
+    /// the refund and releases the deducted amount to the merchant. Only
+    /// merchant/admin approval paths call this; refunds resolved in the
+    /// customer's favour via appeal or escalation are exempt.
+    fn apply_restocking_fee(env: &Env, refund: &mut Refund) {
+        let fee_bps = Self::get_restocking_fee_bps(
+            env.clone(),
+            refund.merchant.clone(),
+            refund.reason_code,
+        );
+        // Re-apply the admin cap in case it was lowered after the merchant set the fee.
+        let fee_bps = fee_bps.min(Self::get_max_restocking_fee_bps(env.clone()));
+        if fee_bps == 0 {
+            refund.restocking_fee = 0;
+            return;
+        }
+
+        let fee = (refund.amount as u128 * fee_bps as u128 / 10_000) as i128;
+        refund.restocking_fee = fee;
+        if fee > 0 {
+            let client = token::Client::new(env, &refund.token);
+            client.transfer(&env.current_contract_address(), &refund.merchant, &fee);
+            events::emit_restocking_fee_applied(
+                env,
+                refund.id,
+                refund.merchant.clone(),
+                fee_bps,
+                fee,
+            );
+        }
+    }
+
+    // --- Feature: Product Recall Events ---
+
+    /// Merchant declares a product recall covering `payment_ids`. Each payment
+    /// must belong to the merchant and be settled. The total refund amount is
+    /// locked from the merchant's reserve so customers can self-serve claims.
+    pub fn declare_recall(
+        env: Env,
+        merchant: Address,
+        recall_id_hash: BytesN<32>,
+        payment_ids: Vec<u32>,
+        refund_bps: u32,
+        claim_deadline: u64,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if payment_ids.is_empty() {
+            panic!("RecallRequiresPayments");
+        }
+        if refund_bps == 0 || refund_bps > 10_000 {
+            panic!("InvalidRecallRefundBps");
+        }
+        let now = env.ledger().timestamp();
+        if claim_deadline <= now {
+            panic!("RecallDeadlineMustBeInFuture");
+        }
+
+        let reserve_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey2::ReserveToken)
+            .unwrap_or_else(|| panic!("Reserve token not configured"));
+
+        let payment_contract_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress)
+            .expect("Payment contract not configured");
+        let payment_client =
+            payment_contract::PaymentContractClient::new(&env, &payment_contract_addr);
+
+        let mut claim_amounts: Map<u32, i128> = Map::new(&env);
+        let mut total: i128 = 0;
+        for payment_id in payment_ids.iter() {
+            if claim_amounts.contains_key(payment_id) {
+                panic!("DuplicateRecallPayment");
+            }
+            let payment = payment_client
+                .try_get_payment(&payment_id)
+                .unwrap_or_else(|_| panic!("PaymentContractError: payment not found"))
+                .unwrap_or_else(|_| panic!("PaymentContractError: payment not found"));
+            if payment.merchant != merchant {
+                panic!("RecallPaymentNotOwnedByMerchant");
+            }
+            if payment.status != payment_contract::PaymentStatus::Completed {
+                panic!("RecallPaymentNotSettled");
+            }
+            if payment.token != reserve_token {
+                panic!("RecallPaymentTokenMismatch");
+            }
+            let amount = (payment.amount as u128 * refund_bps as u128 / 10_000) as i128;
+            claim_amounts.set(payment_id, amount);
+            total += amount;
+        }
+
+        let reserve_key = DataKey2::MerchantReserveBalance(merchant.clone());
+        let reserve: i128 = env.storage().persistent().get(&reserve_key).unwrap_or(0);
+        if reserve < total {
+            panic!("InsufficientReserveForRecall");
+        }
+        env.storage().persistent().set(&reserve_key, &(reserve - total));
+        env.storage().persistent().extend_ttl(
+            &reserve_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let recall_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::RecallCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey2::RecallCounter, &recall_id);
+
+        let recall = Recall {
+            recall_id,
+            merchant: merchant.clone(),
+            recall_id_hash: recall_id_hash.clone(),
+            claim_amounts,
+            refund_bps,
+            claim_deadline,
+            token: reserve_token,
+            locked_amount: total,
+            claimed_amount: 0,
+            declared_at: now,
+            closed: false,
+        };
+        Self::save_recall(&env, &recall);
+
+        events::emit_recall_declared(
+            &env,
+            recall_id,
+            merchant,
+            recall_id_hash,
+            payment_ids.len(),
+            refund_bps,
+            total,
+            claim_deadline,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        recall_id
+    }
+
+    /// Customer claims their recall refund for `payment_id`. Only the payer of
+    /// the payment may claim, once per payment, before the claim deadline.
+    /// Recall claims are not counted towards the customer's abuse score.
+    pub fn claim_recall_refund(env: Env, customer: Address, recall_id: u32, payment_id: u32) -> i128 {
+        Self::require_not_paused(&env);
+        customer.require_auth();
+
+        let mut recall = Self::load_recall(&env, recall_id);
+        if recall.closed {
+            panic!("RecallClosed");
+        }
+        if env.ledger().timestamp() > recall.claim_deadline {
+            panic!("RecallClaimDeadlinePassed");
+        }
+        let amount = recall
+            .claim_amounts
+            .get(payment_id)
+            .unwrap_or_else(|| panic!("PaymentNotInRecall"));
+
+        let claimed_key = DataKey2::RecallClaimed(recall_id, payment_id);
+        if env.storage().persistent().has(&claimed_key) {
+            panic!("RecallAlreadyClaimed");
+        }
+
+        let payment_contract_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress)
+            .expect("Payment contract not configured");
+        let payment_client =
+            payment_contract::PaymentContractClient::new(&env, &payment_contract_addr);
+        let payment = payment_client
+            .try_get_payment(&payment_id)
+            .unwrap_or_else(|_| panic!("PaymentContractError: payment not found"))
+            .unwrap_or_else(|_| panic!("PaymentContractError: payment not found"));
+        if payment.customer != customer {
+            panic!("OnlyPayerCanClaimRecall");
+        }
+
+        env.storage().persistent().set(&claimed_key, &true);
+        env.storage().persistent().extend_ttl(
+            &claimed_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        recall.claimed_amount += amount;
+        Self::save_recall(&env, &recall);
+
+        // Track the recall payout against the payment's refunded total so the
+        // payment cannot be over-refunded through the regular refund flow.
+        let already_refunded: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RefundedAmount(payment_id))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RefundedAmount(payment_id), &(already_refunded + amount));
+        env.storage().persistent().extend_ttl(
+            &DataKey::RefundedAmount(payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        if amount > 0 {
+            let client = token::Client::new(&env, &recall.token);
+            client.transfer(&env.current_contract_address(), &customer, &amount);
+        }
+
+        events::emit_recall_refund_claimed(&env, recall_id, payment_id, customer, amount);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        amount
+    }
+
+    /// Merchant closes a recall after its claim deadline, releasing any
+    /// unclaimed locked amount back to their reserve balance.
+    pub fn close_recall(env: Env, merchant: Address, recall_id: u32) -> i128 {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let mut recall = Self::load_recall(&env, recall_id);
+        if recall.merchant != merchant {
+            panic!("OnlyRecallMerchantCanClose");
+        }
+        if recall.closed {
+            panic!("RecallClosed");
+        }
+        if env.ledger().timestamp() <= recall.claim_deadline {
+            panic!("RecallClaimWindowOpen");
+        }
+
+        let unclaimed = recall.locked_amount - recall.claimed_amount;
+        recall.closed = true;
+        Self::save_recall(&env, &recall);
+
+        if unclaimed > 0 {
+            let reserve_key = DataKey2::MerchantReserveBalance(merchant.clone());
+            let reserve: i128 = env.storage().persistent().get(&reserve_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&reserve_key, &(reserve + unclaimed));
+            env.storage().persistent().extend_ttl(
+                &reserve_key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        events::emit_recall_closed(&env, recall_id, merchant, unclaimed);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        unclaimed
+    }
+
+    /// View: recall record by ID.
+    pub fn get_recall(env: Env, recall_id: u32) -> Recall {
+        Self::load_recall(&env, recall_id)
+    }
+
+    /// View: whether `payment_id` has been claimed under `recall_id`.
+    pub fn get_recall_claim_status(env: Env, recall_id: u32, payment_id: u32) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey2::RecallClaimed(recall_id, payment_id))
+    }
+
+    fn load_recall(env: &Env, recall_id: u32) -> Recall {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::Recall(recall_id))
+            .unwrap_or_else(|| panic!("RecallNotFound"))
+    }
+
+    fn save_recall(env: &Env, recall: &Recall) {
+        let key = DataKey2::Recall(recall.recall_id);
+        env.storage().persistent().set(&key, recall);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     /// Returns the `RefundPolicy` snapshot captured at the time a given refund
@@ -6148,6 +6642,12 @@ mod test_delegates;
 
 #[cfg(test)]
 mod test_appeal;
+
+#[cfg(test)]
+mod test_restocking_fee;
+
+#[cfg(test)]
+mod test_recall;
 /// Event: Customer appealed a rejected refund (#159)
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -6182,6 +6682,7 @@ pub struct RefundApproved {
     pub refund_id: u32,
     pub approved_by: Address,
     pub approved_at: u64,
+    pub restocking_fee: i128,
 }
 
 /// Event: Refund rejected

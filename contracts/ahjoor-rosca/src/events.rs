@@ -2198,3 +2198,58 @@ pub fn emit_group_cloned(
     }
     .publish(e);
 }
+
+// ── Payout Beneficiary Nomination ─────────────────────────────────────────────
+
+/// Event: A member nominated a beneficiary to receive their payout.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PayoutBeneficiarySet {
+    pub member: Address,
+    pub beneficiary: Address,
+}
+
+pub fn emit_payout_beneficiary_set(e: &Env, member: Address, beneficiary: Address) {
+    PayoutBeneficiarySet { member, beneficiary }.publish(e);
+}
+
+/// Event: A member cleared their nominated payout beneficiary.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PayoutBeneficiaryCleared {
+    pub member: Address,
+}
+
+pub fn emit_payout_beneficiary_cleared(e: &Env, member: Address) {
+    PayoutBeneficiaryCleared { member }.publish(e);
+}
+
+/// Event: A round payout was delivered. `beneficiary` is the address that
+/// actually received the funds (equal to `member` when none is nominated).
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PayoutDelivered {
+    pub round: u32,
+    pub member: Address,
+    pub beneficiary: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+pub fn emit_payout_delivered(
+    e: &Env,
+    round: u32,
+    member: Address,
+    beneficiary: Address,
+    token: Address,
+    amount: i128,
+) {
+    PayoutDelivered {
+        round,
+        member,
+        beneficiary,
+        token,
+        amount,
+    }
+    .publish(e);
+}

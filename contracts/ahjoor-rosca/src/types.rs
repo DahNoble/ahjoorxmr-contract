@@ -444,6 +444,10 @@ pub enum DataKey5 {
     /// Option<GroupCloneRecord> — metadata written when this contract was created
     /// by cloning another group.  None when the group was created from scratch.
     CloneOrigin,
+
+    // ── Payout Beneficiary Nomination ─────────────────────────────────────────
+    /// Address — the beneficiary nominated by a member to receive their payout.
+    PayoutBeneficiary(Address),
 }
 
 // ── Scoped Co-Admin Role ──────────────────────────────────────────────────────

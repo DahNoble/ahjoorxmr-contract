@@ -239,4 +239,9 @@ pub enum ExtError2 {
     // ── Group Cloning ─────────────────────────────────────────────────────────
     /// The source contract address provided for cloning is invalid (same as this contract).
     CloneSourceInvalid = 133,
+    // ── Payout Beneficiary Nomination ─────────────────────────────────────────
+    /// Beneficiary changes are locked while the member's payout round is in progress.
+    BeneficiaryLocked = 134,
+    /// The beneficiary address is invalid (e.g. the contract itself).
+    InvalidBeneficiary = 135,
 }
